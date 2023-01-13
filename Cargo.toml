@@ -1,0 +1,26 @@
+[package]
+name = "fuga-json-seq-parser"
+version = "0.1.0"
+edition = "2021"
+authors = ["Kenta IDA <fuga@fugafuga.org>"]
+license = "MIT"
+description = "Sequential JSON Parser for Low Memory Systems"
+repository = "https://github.com/ciniml/fuga-json-seq-parser"
+readme = "README.md"
+categories = ["parser-implementations", "no-std"]
+keywords = ["json", "no-std"]
+
+[dependencies]
+aquamarine = "0.1.12"
+embedded-io = "0.3.0"
+heapless = { version = "0.7.16" }
+nom = { version = "7.1.1", default-features = false }
+uuid = { version = "1.2.1", default-features = false }
+
+[features]
+default = []
+std = ["embedded-io/std"]
+
+[[example]]
+name = "parse_json_devices"
+required-features = ["std"]
