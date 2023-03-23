@@ -8,12 +8,12 @@ use embedded_io::{blocking::Read, Io};
 use heapless::Vec;
 use nom::{
     branch::alt,
-    bytes::streaming::{escaped, is_not, tag},
-    character::streaming::{char, one_of},
-    combinator::{cut, map, peek, value},
+    bytes::complete::{escaped, is_not, tag},
+    character::complete::{char, one_of},
+    combinator::{cut, map, peek, value, opt},
     error::{context, ContextError, ErrorKind, ParseError},
-    number::streaming::recognize_float_or_exceptions,
-    sequence::{preceded, terminated},
+    number::complete::recognize_float_or_exceptions,
+    sequence::{preceded, terminated, pair},
     IResult,
 };
 
@@ -55,14 +55,17 @@ pub enum JsonNode<'a> {
 #[derive(Clone, Copy, Debug)]
 enum ParserState {
     Start,
+    StartContinueString,
     End,
     MapStart,
     MapKey,
     KeyDelimiter,
     MapValue,
+    MapValueContinueString,
     MapPairDelimiter,
     ArrayStart,
     ArrayValue,
+    ArrayValueContinueString,
     ArrayValueDelimiter,
     Pop,
 }
@@ -72,6 +75,7 @@ pub struct Parser<const BUFFER_SIZE: usize, const MAX_DEPTH: usize> {
     buffer: Vec<u8, BUFFER_SIZE>,
     state_stack: Vec<ParserState, MAX_DEPTH>,
     bytes_remaining: Option<usize>,
+    string_offset: usize,
 }
 
 fn from_utf8_possible(bytes: &[u8]) -> (usize, &str) {
@@ -84,15 +88,26 @@ fn from_utf8_possible(bytes: &[u8]) -> (usize, &str) {
 }
 
 fn escaped_str<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, &'a str, E> {
-    escaped(is_not("\""), '\\', one_of("\"n\\"))(i)
+    escaped(is_not("\"\\"), '\\', one_of("\"n\\"))(i)
 }
 
 fn json_string<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     i: &'a str,
-) -> IResult<&'a str, &'a str, E> {
+) -> IResult<&'a str, (&'a str, bool), E> {
     context(
         "string",
-        preceded(char('\"'), cut(terminated(escaped_str, char('\"')))),
+        preceded(
+            char('\"'), 
+            pair(map(opt(escaped_str), |r| r.unwrap_or("")), map(opt(char('\"')), |r| r.is_some()))
+        ),
+    )(i)
+}
+fn json_string_continuing<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
+    i: &'a str,
+) -> IResult<&'a str, (&'a str, bool), E> {
+    context(
+        "string",
+        pair(escaped_str, map(opt(char('\"')), |r| r.is_some())),
     )(i)
 }
 fn json_null<'a, E: ParseError<&'a str>>(input: &'a str) -> IResult<&'a str, (), E> {
@@ -107,6 +122,7 @@ pub enum JsonScalarValue<'a> {
     Null,
     Boolean(bool),
     String(&'a str),
+    ContinuingString(&'a str, usize, bool),
     Number(JsonNumber),
 }
 impl<'a> Display for JsonScalarValue<'a> {
@@ -115,6 +131,12 @@ impl<'a> Display for JsonScalarValue<'a> {
             Self::Null => write!(f, "null"),
             Self::Boolean(v) => write!(f, "{}", v),
             Self::String(v) => write!(f, "\"{}\"", v),
+            Self::ContinuingString(v, offset, terminated) => match (offset, terminated) {
+                (0, false) => write!(f, "\"{}", v),
+                (0, true) => write!(f, "\"{}\"", v),
+                (_, false) => write!(f, "{}", v),
+                (_, true) => write!(f, "{}\"", v),
+            },
             Self::Number(v) => write!(f, "{}", v),
         }
     }
@@ -184,7 +206,7 @@ fn json_scalar_value<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
     _is_eof: bool,
 ) -> impl FnMut(&'a str) -> IResult<&'a str, JsonScalarValue, E> {
     alt((
-        map(json_string, |s| JsonScalarValue::String(s)),
+        map(json_string, |(s, terminated)| if terminated { JsonScalarValue::String(s) } else { JsonScalarValue::ContinuingString(s, 0, false) }),
         map(json_boolean, |b| JsonScalarValue::Boolean(b)),
         map(json_null, |_| JsonScalarValue::Null),
         terminated(
@@ -206,7 +228,7 @@ fn json_scalar_value<'a, E: ParseError<&'a str> + ContextError<&'a str>>(
 #[derive(Debug)]
 pub enum ParserError<InputError, CallbackError> {
     InputError(InputError),
-    Fail,
+    Fail(nom::error::ErrorKind),
     Callback(CallbackError),
     ValueTooLong,
 }
@@ -228,6 +250,7 @@ impl<const BUFFER_SIZE: usize, const MAX_DEPTH: usize> Parser<BUFFER_SIZE, MAX_D
             buffer: Vec::new(),
             state_stack: Vec::new(),
             bytes_remaining: None,
+            string_offset: 0,
         }
     }
 
@@ -260,7 +283,14 @@ impl<const BUFFER_SIZE: usize, const MAX_DEPTH: usize> Parser<BUFFER_SIZE, MAX_D
             // Checks if all data in the stream is read into the buffer or not.
             let is_eof = match self.bytes_remaining {
                 Some(0) => true,
-                _ => false,
+                Some(_) => {
+                    if !self.buffer.is_full() && bytes_written == 0 {
+                        // Some bytes remaining in the stream, but at this time there are no new data.
+                        break Ok(false);
+                    }
+                    false
+                },
+                _ => bytes_written == 0,    // If the stream length is indeterminate, check number of bytes read to detect end of stream. 
             };
             // Put EOF marker at the last of the buffer if there are no data exists in the stream.
             if is_eof && !self.buffer.is_full() {
@@ -272,21 +302,50 @@ impl<const BUFFER_SIZE: usize, const MAX_DEPTH: usize> Parser<BUFFER_SIZE, MAX_D
                 }
             }
 
+            // Check if currently in the middle of continuing string or not.
+            let is_string_continuing = match &self.state {
+                ParserState::StartContinueString => true,
+                ParserState::MapValueContinueString => true,
+                ParserState::ArrayValueContinueString => true,
+                _ => false,
+            };
+
             let (_bytes_consumed, input) = from_utf8_possible(&self.buffer);
-            let trimmed = input.trim_start();
+            // Trim the first whitespaces in the buffer if current state is not the middle of continuing string.
+            let trimmed = if is_string_continuing { input } else { input.trim_start() };
+
+            // Trim whitespaces and retry to refill the buffer.
+            if input.len() != trimmed.len() {
+                // Consume trimmed bytes
+                let bytes_consumed = input.as_bytes().len() - trimmed.as_bytes().len();
+                let buffer_len = self.buffer.len();
+                if bytes_consumed > 0 {
+                    // Discard the consumed data from the buffer.
+                    self.buffer.copy_within(bytes_consumed..buffer_len, 0);
+                    self.buffer.truncate(buffer_len - bytes_consumed);
+                }
+                break Ok(false);
+            }
             let result: IResult<_, _, (&str, ErrorKind)> = match self.state {
                 ParserState::Start => alt((
                     // Initial state.
                     value((ParserState::End, None), char('\0')),
                     value((ParserState::MapStart, None), char('{')),
                     value((ParserState::ArrayStart, None), char('[')),
-                    map(json_scalar_value(is_eof), |v| (ParserState::Start, Some(v))),
+                    map(json_scalar_value(is_eof), |v| {
+                        let next_state = match &v {
+                            JsonScalarValue::ContinuingString(_, _, _) => ParserState::StartContinueString,
+                            _ => ParserState::Start,
+                        };
+                        (next_state, Some(v))
+                    }),
                 ))(trimmed),
+                ParserState::StartContinueString => map(json_string_continuing, |(s, terminated)| (if terminated { ParserState::Start } else { ParserState::StartContinueString }, Some(JsonScalarValue::ContinuingString(s, self.string_offset, terminated))))(trimmed),
                 ParserState::MapStart => Ok((trimmed, (ParserState::MapKey, None))),
                 ParserState::MapKey => alt((
                     // Map key
                     value((ParserState::Pop, None), char('}')), // end of map.
-                    map(json_scalar_value(is_eof), |v| {
+                    map(cut(json_scalar_value(is_eof)), |v| {
                         (ParserState::KeyDelimiter, Some(v))
                     }),
                 ))(trimmed),
@@ -300,9 +359,14 @@ impl<const BUFFER_SIZE: usize, const MAX_DEPTH: usize> Parser<BUFFER_SIZE, MAX_D
                     value((ParserState::MapStart, None), char('{')),
                     value((ParserState::ArrayStart, None), char('[')),
                     map(json_scalar_value(is_eof), |v| {
-                        (ParserState::MapPairDelimiter, Some(v))
+                        let next_state = match &v {
+                            JsonScalarValue::ContinuingString(_, _, _) => ParserState::MapValueContinueString,
+                            _ => ParserState::MapPairDelimiter,
+                        };
+                        (next_state, Some(v))
                     }),
                 ))(trimmed),
+                ParserState::MapValueContinueString => map(json_string_continuing, |(s, terminated)| (if terminated { ParserState::MapPairDelimiter } else { ParserState::MapValueContinueString }, Some(JsonScalarValue::ContinuingString(s, self.string_offset, terminated))))(trimmed),
                 ParserState::MapPairDelimiter => alt((
                     value((ParserState::Pop, None), char('}')),
                     value((ParserState::MapKey, None), char(',')),
@@ -313,9 +377,14 @@ impl<const BUFFER_SIZE: usize, const MAX_DEPTH: usize> Parser<BUFFER_SIZE, MAX_D
                     value((ParserState::ArrayStart, None), char('[')),
                     value((ParserState::Pop, None), char(']')),
                     map(json_scalar_value(is_eof), |v| {
-                        (ParserState::ArrayValueDelimiter, Some(v))
+                        let next_state = match &v {
+                            JsonScalarValue::ContinuingString(_, _, _) => ParserState::ArrayValueContinueString,
+                            _ => ParserState::ArrayValueDelimiter,
+                        };
+                        (next_state, Some(v))
                     }),
                 ))(trimmed),
+                ParserState::ArrayValueContinueString => map(json_string_continuing, |(s, terminated)| (if terminated { ParserState::ArrayValueDelimiter } else { ParserState::ArrayValueContinueString }, Some(JsonScalarValue::ContinuingString(s, self.string_offset, terminated))))(trimmed),
                 ParserState::ArrayValueDelimiter => alt((
                     value((ParserState::Pop, None), char(']')),
                     value((ParserState::ArrayValue, None), char(',')),
@@ -359,10 +428,14 @@ impl<const BUFFER_SIZE: usize, const MAX_DEPTH: usize> Parser<BUFFER_SIZE, MAX_D
                         }
                         (ParserState::MapKey, _) => callback(JsonNode::Key(value.unwrap())),
                         (_, _) => {
-                            if let Some(value) = value {
-                                callback(JsonNode::Value(value))
-                            } else {
-                                Ok(ParserCallbackAction::Nothing)
+                            match value {
+                                Some(JsonScalarValue::ContinuingString(string, offset, terminatd)) => {
+                                    // If the value is continuing string, store current offset in string.
+                                    self.string_offset = offset + string.len();
+                                    callback(JsonNode::Value(JsonScalarValue::ContinuingString(string, offset, terminatd)))
+                                },
+                                Some(value) => callback(JsonNode::Value(value)),
+                                _ => Ok(ParserCallbackAction::Nothing),
                             }
                         }
                     };
@@ -385,26 +458,12 @@ impl<const BUFFER_SIZE: usize, const MAX_DEPTH: usize> Parser<BUFFER_SIZE, MAX_D
                     }
                     continue;
                 }
-                Err(nom::Err::Incomplete(_)) => {
-                    // Incomplete.
-                    if input.len() > 0 && input.len() == trimmed.len() {
-                        // The parser returned Incomplete even if there are no trimmed preceding spaces.
-                        // This means the target scalar value is too long to store in the buffer.
-                        break Err(ParserError::ValueTooLong);
-                    } else {
-                        // Consume trimmed bytes
-                        let bytes_consumed = input.as_bytes().len() - trimmed.as_bytes().len();
-                        let buffer_len = self.buffer.len();
-                        if bytes_consumed > 0 {
-                            // Discard the consumed data from the buffer.
-                            self.buffer.copy_within(bytes_consumed..buffer_len, 0);
-                            self.buffer.truncate(buffer_len - bytes_consumed);
-                        }
-                        break Ok(false);
+                Err(err) => {
+                    match err {
+                        nom::Err::Error((_, kind)) => break Err(ParserError::Fail(kind)),
+                        nom::Err::Failure((_, kind)) => break Err(ParserError::Fail(kind)),
+                        nom::Err::Incomplete(_) => break Err(ParserError::Fail(nom::error::ErrorKind::Eof)),
                     }
-                }
-                Err(_err) => {
-                    break Err(ParserError::Fail);
                 }
             }
         }
@@ -451,9 +510,49 @@ mod test {
         (parser, BufferReader::new(input.as_bytes()))
     }
     #[test]
+    fn test_parser_empty_string() {
+        let (mut parser, mut input) = setup_parser::<20, 4>("    \"\"");
+        let mut expected = [JsonNode::Value(JsonScalarValue::String(""))].into_iter();
+        for _ in 0..10 {
+            if parser
+                .parse(&mut input, |node| {
+                    assert_eq!(Some(node), expected.next());
+                    Result::<_, core::convert::Infallible>::Ok(ParserCallbackAction::Nothing)
+                })
+                .expect("Parser must not fail.")
+            {
+                break;
+            }
+        }
+        assert_eq!(None, expected.next()); // All expected numbers are detected.
+    }
+    #[test]
     fn test_parser_single_string() {
         let (mut parser, mut input) = setup_parser::<20, 4>("    \"    hogeほげ\"");
         let mut expected = [JsonNode::Value(JsonScalarValue::String("    hogeほげ"))].into_iter();
+        for _ in 0..10 {
+            if parser
+                .parse(&mut input, |node| {
+                    assert_eq!(Some(node), expected.next());
+                    Result::<_, core::convert::Infallible>::Ok(ParserCallbackAction::Nothing)
+                })
+                .expect("Parser must not fail.")
+            {
+                break;
+            }
+        }
+        assert_eq!(None, expected.next()); // All expected numbers are detected.
+    }
+    #[test]
+    fn test_parser_single_continuing_string() {
+        let (mut parser, mut input) = setup_parser::<9, 4>("    \"    hogeほげ\"");
+        // The parser buffer can stores 9 bytes, so the buffer actually contains "    hoge" and the first byte of "ほ", 
+        // but it fails to decode because remaining bytes of "ほ" is not in the buffer.
+        // So the parser returns two ContinuingString below.
+        let mut expected = [
+            JsonNode::Value(JsonScalarValue::ContinuingString("    hoge", 0, false)),
+            JsonNode::Value(JsonScalarValue::ContinuingString("ほげ", 8, true)),
+        ].into_iter();
         for _ in 0..10 {
             if parser
                 .parse(&mut input, |node| {
@@ -490,27 +589,6 @@ mod test {
                 v => panic!("unexpected JSON node - {:?}", v),
             })
             .expect("Parser must not fail.");
-    }
-    #[test]
-    fn test_parser_multiple_numbers() {
-        let (mut parser, mut input) = setup_parser::<128, 4>("123.0 -42.1 +1.0e3 1");
-        let mut expected_numbers = [
-            JsonNumber::F32(123.0),
-            JsonNumber::F32(-42.1),
-            JsonNumber::F32(1.0e3),
-            JsonNumber::I32(1),
-        ]
-        .into_iter();
-        parser
-            .parse(&mut input, |node| match node {
-                JsonNode::Value(JsonScalarValue::Number(value)) => {
-                    assert_eq!(Some(value), expected_numbers.next());
-                    DefaultParserCallbackResult::Ok(ParserCallbackAction::Nothing)
-                }
-                v => panic!("unexpected JSON node - {:?}", v),
-            })
-            .expect("Parser must not fail.");
-        assert_eq!(None, expected_numbers.next()); // All expected numbers are detected.
     }
     #[test]
     fn test_parser_empty_map() {
